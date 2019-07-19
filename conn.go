@@ -7,9 +7,9 @@ import (
 	"reflect"
 	"sync"
 
-	engineio "github.com/googollee/go-engine.io"
+	engineio "github.com/hirachmat/go-engine.io"
 
-	"github.com/googollee/go-socket.io/parser"
+	"github.com/hirachmat/go-socket.io/parser"
 )
 
 // Conn is a connection in go-socket.io
@@ -30,6 +30,13 @@ type Conn interface {
 	SetContext(v interface{})
 	Namespace() string
 	Emit(msg string, v ...interface{})
+	On(event string, f interface{})
+
+	// Broadcast server side apis
+	Join(room string)
+	Leave(room string)
+	LeaveAll()
+	Rooms() []string
 }
 
 type errorMessage struct {
@@ -44,20 +51,23 @@ type writePacket struct {
 
 type conn struct {
 	engineio.Conn
-	encoder    *parser.Encoder
-	decoder    *parser.Decoder
-	errorChan  chan errorMessage
-	writeChan  chan writePacket
-	quitChan   chan struct{}
-	handlers   map[string]*namespaceHandler
-	namespaces map[string]*namespaceConn
-	closeOnce  sync.Once
-	id         uint64
+	broadcast     Broadcast
+	encoder       *parser.Encoder
+	decoder       *parser.Decoder
+	errorChan     chan errorMessage
+	writeChan     chan writePacket
+	quitChan      chan struct{}
+	handlers      map[string]*namespaceHandler
+	namespaces    map[string]*namespaceConn
+	eventHandlers sync.Map
+	closeOnce     sync.Once
+	id            uint64
 }
 
-func newConn(c engineio.Conn, handlers map[string]*namespaceHandler) (*conn, error) {
+func newConn(c engineio.Conn, handlers map[string]*namespaceHandler, broadcast Broadcast) (*conn, error) {
 	ret := &conn{
 		Conn:       c,
+		broadcast:  broadcast,
 		encoder:    parser.NewEncoder(c),
 		decoder:    parser.NewDecoder(c),
 		errorChan:  make(chan errorMessage),
@@ -82,8 +92,16 @@ func (c *conn) Close() error {
 	return err
 }
 
+func (c *conn) On(event string, f interface{}) {
+	if f != nil {
+		c.eventHandlers.Store(event, newAckFunc(f))
+	} else {
+		c.eventHandlers.Delete(event)
+	}
+}
+
 func (c *conn) connect() error {
-	root := newNamespaceConn(c, "/")
+	root := newNamespaceConn(c, "/", c.broadcast)
 	c.namespaces[""] = root
 	header := parser.Header{
 		Type: parser.Connect,
@@ -198,6 +216,16 @@ func (c *conn) serveRead() {
 				c.decoder.DiscardLast()
 				continue
 			}
+			if ret, err, handled := c.dispatch(event, header); handled {
+				if err != nil {
+					return
+				}
+				if len(ret) > 0 {
+					header.Type = parser.Ack
+					c.write(header, ret)
+				}
+				return
+			}
 			handler, ok := c.handlers[header.Namespace]
 			if !ok {
 				c.decoder.DiscardLast()
@@ -225,9 +253,10 @@ func (c *conn) serveRead() {
 			}
 			conn, ok := c.namespaces[header.Namespace]
 			if !ok {
-				conn = newNamespaceConn(c, header.Namespace)
+				conn = newNamespaceConn(c, header.Namespace, c.broadcast)
 				c.namespaces[header.Namespace] = conn
 			}
+			c.dispatch("connection", header)
 			handler, ok := c.handlers[header.Namespace]
 			if ok {
 				handler.dispatch(conn, header, "", nil)
@@ -246,12 +275,26 @@ func (c *conn) serveRead() {
 				continue
 			}
 			delete(c.namespaces, header.Namespace)
+			c.dispatch("disconnection", header)
 			handler, ok := c.handlers[header.Namespace]
 			if ok {
 				handler.dispatch(conn, header, "", args)
 			}
 		}
 	}
+}
+
+func (c *conn) dispatch(event string, header parser.Header) ([]reflect.Value, error, bool) {
+	if callbackValue, ok := c.eventHandlers.Load(event); ok {
+		if callback, ok := callbackValue.(*funcHandler); ok {
+			if args, err := c.decoder.DecodeArgs(callback.argTypes); err != nil {
+				ret, err := callback.Call(args)
+				return ret, err, false
+			}
+		}
+	}
+
+	return nil, nil, false
 }
 
 func (c *conn) namespace(nsp string) *namespaceHandler {

@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	engineio "github.com/googollee/go-engine.io"
+	engineio "github.com/hirachmat/go-engine.io"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
